@@ -1,0 +1,549 @@
+import pandas as pd
+import os
+from torch.utils.data import Dataset, DataLoader
+import torch
+import torchvision
+from torchvision import transforms
+from PIL import Image
+import numpy as np
+from tqdm import tqdm
+from torchvision.models.detection import retinanet_resnet50_fpn, RetinaNet_ResNet50_FPN_Weights
+from torchvision.ops import nms
+import torch.nn as nn
+from sklearn.model_selection import train_test_split
+import warnings
+import random
+import matplotlib.pyplot as plt
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+warnings.filterwarnings('ignore')
+
+# Улучшенные конфигурационные параметры
+CONFIG = {
+    'image_size': 1024,
+    'batch_size': 4,
+    'num_epochs': 99,  # Увеличили количество эпох
+    'learning_rate': 1e-4,  # Увеличили learning rate
+    'score_thresh': 0.2,  # Повысили порог
+    'iou_thresh': 0.3,
+    'augmentation': True,
+    'num_workers': 2,
+    'early_stopping_patience': 15,
+    'weight_decay': 1e-4,
+    'topk_candidates': 500  # Увеличьте количество кандидатов
+}
+
+
+def initialize():
+    """Инициализация данных"""
+    print("Инициализация данных...")
+
+    train_data_dir = 'C:\\Users\\Алинка\\PyCharmMiscProject\\where-are-the-seagulls\\data\\train'
+    test_data_dir = 'C:\\Users\\Алинка\\PyCharmMiscProject\\where-are-the-seagulls\\data\\test'
+
+    train_image_dir = os.path.join(train_data_dir, 'images')
+    train_label_dir = os.path.join(train_data_dir, 'labels')
+    test_image_dir = os.path.join(test_data_dir, 'images')
+
+    for path in [train_image_dir, train_label_dir, test_image_dir]:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Директория не найдена: {path}")
+
+    print(f"Train изображения: {train_image_dir}")
+    print(f"Train аннотации: {train_label_dir}")
+    print(f"Test изображения: {test_image_dir}")
+
+    rows = []
+    label_files = [f for f in os.listdir(train_label_dir) if f.endswith('.txt')]
+    missing_images = 0
+    invalid_annotations = 0
+
+    for label_file in tqdm(label_files, desc="Загрузка аннотаций"):
+        image_id = label_file.replace('.txt', '.jpg')
+        label_path = os.path.join(train_label_dir, label_file)
+        image_path = os.path.join(train_image_dir, image_id)
+
+        if not os.path.exists(image_path):
+            missing_images += 1
+            continue
+
+        with open(label_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) != 5:
+                    invalid_annotations += 1
+                    continue
+
+                try:
+                    row = {
+                        'image_id': image_id,
+                        'class': int(parts[0]),
+                        'x_center': float(parts[1]),
+                        'y_center': float(parts[2]),
+                        'width': float(parts[3]),
+                        'height': float(parts[4])
+                    }
+                    rows.append(row)
+                except ValueError:
+                    invalid_annotations += 1
+                    continue
+
+    if not rows:
+        raise ValueError("Не загружено ни одной аннотации")
+
+    df = pd.DataFrame(rows)
+    unique_images = df['image_id'].unique()
+    image_classes = df.groupby('image_id')['class'].first().values
+
+    print("Проверка аннотаций:")
+    print(f"Всего изображений: {len(unique_images)}")
+    print(f"Всего аннотаций: {len(df)}")
+    print(f"Среднее количество чаек на изображение: {len(df) / len(unique_images):.2f}")
+    print(f"Размеры изображений: {next(iter(Image.open(os.path.join(train_image_dir, unique_images[0])).size))}")
+
+    train_ids, val_ids = train_test_split(
+        unique_images,
+        test_size=0.2,
+        random_state=42,
+        stratify=image_classes  # Стратификация по классам изображений
+    )
+
+    train_df = df[df['image_id'].isin(train_ids)]
+    val_df = df[df['image_id'].isin(val_ids)]
+
+    test_images = [f for f in os.listdir(test_image_dir) if f.endswith('.jpg')]
+    if not test_images:
+        raise ValueError("Нет тестовых изображений")
+
+    print(f"\nЗагружено {len(df)} аннотаций")
+    print(f"Тренировочные изображения: {len(train_ids)}")
+    print(f"Валидационные изображения: {len(val_ids)}")
+    print(f"Тестовые изображения: {len(test_images)}")
+
+    return train_df, val_df, test_images, train_image_dir, test_image_dir
+
+
+def get_transform(train=False):
+    if train and CONFIG['augmentation']:
+        return A.Compose([
+            A.RandomSizedBBoxSafeCrop(CONFIG['image_size'], CONFIG['image_size'], p=0.5),
+            A.RandomShadow(p=0.3),
+            A.RandomFog(p=0.2),
+            A.MotionBlur(blur_limit=7, p=0.3),
+            A.Resize(CONFIG['image_size'], CONFIG['image_size']),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.3),
+            A.RandomRotate90(p=0.3),
+            A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
+            A.GaussianBlur(blur_limit=(3, 7), p=0.2),
+            A.CLAHE(p=0.2),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2(),
+        ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
+    else:
+        return A.Compose([
+            A.Resize(CONFIG['image_size'], CONFIG['image_size']),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2(),
+        ])
+
+
+class SeagullDataset(Dataset):
+    def __init__(self, df, image_dir, transform=None, is_test=False):
+        self.df = df
+        self.image_dir = image_dir
+        self.transform = transform
+        self.is_test = is_test
+
+        if not is_test:
+            self.image_ids = df['image_id'].unique()
+            self.annotations = df.groupby('image_id')
+        else:
+            self.image_ids = [f for f in os.listdir(image_dir) if f.endswith('.jpg')]
+
+        self.image_sizes = {}
+        for img_id in self.image_ids:
+            try:
+                with Image.open(os.path.join(image_dir, img_id)) as img:
+                    self.image_sizes[img_id] = img.size
+            except Exception as e:
+                print(f"Ошибка загрузки {img_id}: {str(e)}")
+                self.image_sizes[img_id] = None
+
+    def __len__(self):
+        return len(self.image_ids)
+
+    def __getitem__(self, idx):
+        image_id = self.image_ids[idx]
+        img_size = self.image_sizes.get(image_id)
+
+        if img_size is None:
+            return None, None
+
+        try:
+            image = Image.open(os.path.join(self.image_dir, image_id)).convert("RGB")
+        except Exception as e:
+            print(f"Ошибка загрузки изображения {image_id}: {str(e)}")
+            return None, None
+
+        if not self.is_test:
+            width, height = img_size
+            records = self.annotations.get_group(image_id)
+
+            boxes = []
+            labels = []
+
+            for _, row in records.iterrows():
+                x_center = row['x_center'] * width
+                y_center = row['y_center'] * height
+                w = row['width'] * width
+                h = row['height'] * height
+
+                x_min = max(0, x_center - w / 2)
+                y_min = max(0, y_center - h / 2)
+                x_max = min(width, x_center + w / 2)
+                y_max = min(height, y_center + h / 2)
+
+                if x_max > x_min and y_max > y_min:
+                    boxes.append([x_min, y_min, x_max, y_max])
+                    labels.append(int(row['class']))
+
+            if len(boxes) == 0:
+                return None, None
+
+            image_np = np.array(image)
+            boxes_np = np.array(boxes, dtype=np.float32)
+
+            if self.transform:
+                try:
+                    transformed = self.transform(image=image_np, bboxes=boxes_np, labels=labels)
+                    image = transformed['image']
+                    boxes = transformed['bboxes']
+                    labels = transformed['labels']
+                except Exception as e:
+                    print(f"Ошибка трансформации: {e}")
+                    return None, None
+
+            target = {
+                'boxes': torch.as_tensor(boxes, dtype=torch.float32),
+                'labels': torch.as_tensor(labels, dtype=torch.int64),
+                'image_id': torch.tensor([idx]),
+                'area': (torch.as_tensor(boxes)[:, 2] - torch.as_tensor(boxes)[:, 0]) *
+                        (torch.as_tensor(boxes)[:, 3] - torch.as_tensor(boxes)[:, 1]),
+                'iscrowd': torch.zeros(len(boxes), dtype=torch.int64)
+            }
+        else:
+            image_np = np.array(image)
+            if self.transform:
+                transformed = self.transform(image=image_np)
+                image = transformed['image']
+            target = {'image_id': torch.tensor([idx])}
+
+        return image, target
+
+def collate_fn(batch):
+    batch = [item for item in batch if item is not None and item[0] is not None and item[1] is not None]
+    if len(batch) == 0:
+        return None, None
+    return tuple(zip(*batch))
+
+def create_datasets(train_df, val_df, test_images, train_image_dir, test_image_dir):
+    """Создание датасетов"""
+    train_dataset = SeagullDataset(train_df, train_image_dir, transform=get_transform(train=True))
+    val_dataset = SeagullDataset(val_df, train_image_dir, transform=get_transform(train=False))
+    test_dataset = SeagullDataset(None, test_image_dir, transform=get_transform(train=False), is_test=True)
+
+    train_indices = [i for i in range(len(train_dataset)) if
+                     train_dataset[i] is not None and train_dataset[i][0] is not None]
+    val_indices = [i for i in range(len(val_dataset)) if val_dataset[i] is not None and val_dataset[i][0] is not None]
+    test_indices = [i for i in range(len(test_dataset)) if
+                    test_dataset[i] is not None and test_dataset[i][0] is not None]
+
+    train_subset = torch.utils.data.Subset(train_dataset, train_indices)
+    val_subset = torch.utils.data.Subset(val_dataset, val_indices)
+    test_subset = torch.utils.data.Subset(test_dataset, test_indices)
+
+    train_loader = DataLoader(
+        train_subset,
+        batch_size=CONFIG['batch_size'],
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=CONFIG['num_workers'],
+        pin_memory=True
+    )
+
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=CONFIG['batch_size'],
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=CONFIG['num_workers'],
+        pin_memory=True
+    )
+
+    test_loader = DataLoader(
+        test_subset,
+        batch_size=1,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=CONFIG['num_workers'],
+        pin_memory=True
+    )
+
+    return train_loader, val_loader, test_loader
+
+
+class SeagullModel(nn.Module):
+    def __init__(self, num_classes=2):
+        super().__init__()
+        weights = RetinaNet_ResNet50_FPN_Weights.DEFAULT
+        self.model = retinanet_resnet50_fpn(weights=weights)
+
+        in_channels = self.model.backbone.out_channels
+        num_anchors = self.model.head.classification_head.num_anchors
+
+        cls_logits = nn.Conv2d(
+            in_channels,
+            num_anchors * num_classes,
+            kernel_size=3,
+            stride=1,
+            padding=1
+        )
+
+        nn.init.normal_(cls_logits.weight, std=0.01)
+        nn.init.constant_(cls_logits.bias, -np.log((1 - 0.01) / 0.01))
+
+        self.model.head.classification_head.cls_logits = cls_logits
+        self.model.head.classification_head.num_classes = num_classes
+
+    def forward(self, images, targets=None):
+        if self.training:
+            if targets is None:
+                raise ValueError("В режиме обучения необходимо передать targets")
+            return self.model(images, targets)
+        else:
+            return self.model(images)
+
+
+def train_model(train_loader, val_loader):
+    """Обучение модели с ранней остановкой"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"\nИспользуется устройство: {device}")
+
+    model = SeagullModel(num_classes=2).to(device)
+    if torch.cuda.is_available():
+        model = torch.nn.DataParallel(model)
+        torch.backends.cudnn.benchmark = True
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=CONFIG['learning_rate'],
+        weight_decay=CONFIG['weight_decay']
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.1,
+        patience=2,
+        verbose=True
+    )
+
+    best_val_loss = float('inf')
+    no_improve = 0
+
+    for epoch in range(CONFIG['num_epochs']):
+        model.train()
+        epoch_train_loss = 0
+        processed_batches = 0
+
+        for images, targets in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{CONFIG['num_epochs']} [Train]"):
+            if images is None or targets is None:
+                continue
+
+            images = list(img.to(device) for img in images)
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+            optimizer.zero_grad()
+            loss_dict = model(images, targets)
+            losses = sum(loss for loss in loss_dict.values())
+            losses.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            epoch_train_loss += losses.item()
+            processed_batches += 1
+
+        model.eval()
+        epoch_val_loss = 0
+        val_batches = 0
+
+        with torch.no_grad():
+            for images, targets in tqdm(val_loader, desc=f"Epoch {epoch + 1}/{CONFIG['num_epochs']} [Val]"):
+                if images is None or targets is None:
+                    continue
+
+                images = list(img.to(device) for img in images)
+                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+                model.train()
+                loss_dict = model(images, targets)
+                model.eval()
+
+                losses = sum(loss for loss in loss_dict.values())
+                epoch_val_loss += losses.item()
+                val_batches += 1
+
+        avg_train_loss = epoch_train_loss / processed_batches if processed_batches > 0 else float('nan')
+        avg_val_loss = epoch_val_loss / val_batches if val_batches > 0 else float('nan')
+
+        scheduler.step(avg_val_loss)
+
+        print(f"\nEpoch {epoch + 1}/{CONFIG['num_epochs']}:")
+        print(f"Train Loss: {avg_train_loss:.4f}")
+        print(f"Val Loss: {avg_val_loss:.4f}")
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            no_improve = 0
+            torch.save(model.state_dict(), 'best_model.pth')
+            print("Модель сохранена (лучшая val loss)")
+        else:
+            no_improve += 1
+            print(f"Нет улучшений {no_improve}/{CONFIG['early_stopping_patience']}")
+
+        if no_improve >= CONFIG['early_stopping_patience']:
+            print(f"Ранняя остановка на эпохе {epoch + 1}")
+            break
+
+    model.load_state_dict(torch.load('best_model.pth'))
+    return model
+
+def denormalize(tensor):
+    mean = torch.tensor([0.485, 0.456, 0.406], device=tensor.device).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=tensor.device).view(3, 1, 1)
+    return tensor * std + mean
+
+
+def visualize_predictions(model, dataset, num_examples=3):
+    model.eval()
+    device = next(model.parameters()).device
+
+    # Денормализация изображений
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+
+    indices = random.sample(range(len(dataset)), num_examples)
+
+    for idx in indices:
+        image, target = dataset[idx]
+        img_vis = denormalize(image).permute(1, 2, 0).cpu().numpy()
+
+        with torch.no_grad():
+            prediction = model([image.to(device)])[0]
+
+        plt.figure(figsize=(15, 10))
+        plt.imshow(np.clip(img_vis, 0, 1))
+
+        # Рисуем ground truth
+        if 'boxes' in target:
+            for box in target['boxes'].cpu():
+                plt.plot([box[0], box[2], box[2], box[0], box[0]],
+                         [box[1], box[1], box[3], box[3], box[1]], 'g', linewidth=2, label='Ground Truth')
+
+        # Рисуем предсказания
+        for box, score in zip(prediction['boxes'].cpu(), prediction['scores'].cpu()):
+            if score > CONFIG['score_thresh']:
+                plt.plot([box[0], box[2], box[2], box[0], box[0]],
+                         [box[1], box[1], box[3], box[3], box[1]], 'r', linewidth=2, label='Prediction')
+
+        plt.title(f"Пример {idx} | Скоринг: {score:.2f}" if len(prediction['scores']) > 0 else f"Пример {idx}")
+        plt.legend()
+        plt.axis('off')
+        plt.show()
+
+
+def create_submission(model, test_image_dir, output_file="submission.csv"):
+    model.eval()
+    device = next(model.parameters()).device
+    test_images = sorted([f for f in os.listdir(test_image_dir) if f.endswith('.jpg')])
+    predictions = []
+    transform = get_transform(train=False)
+
+    for idx, img_name in enumerate(tqdm(test_images, desc="Создание submission")):
+        try:
+            img_path = os.path.join(test_image_dir, img_name)
+            img = Image.open(img_path).convert("RGB")
+            orig_width, orig_height = img.size
+
+            img_np = np.array(img)
+            transformed = transform(image=img_np)
+            img_tensor = transformed['image'].unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                output = model(img_tensor)[0]
+
+            bboxes = []
+            if len(output['boxes']) > 0:
+                boxes = output['boxes'].cpu().numpy()
+                scores = output['scores'].cpu().numpy()
+                labels = output['labels'].cpu().numpy()
+
+                scale_x = orig_width / CONFIG['image_size']
+                scale_y = orig_height / CONFIG['image_size']
+
+                for box, score, label in zip(boxes, scores, labels):
+                    if score > CONFIG['score_thresh']:
+                        x_min, y_min, x_max, y_max = box  # Ключевое исправление!
+                        x_min = max(0, x_min * scale_x)
+                        x_max = min(orig_width, x_max * scale_x)
+                        y_min = max(0, y_min * scale_y)
+                        y_max = min(orig_height, y_max * scale_y)
+
+                        x_center = ((x_min + x_max) / 2) / orig_width
+                        y_center = ((y_min + y_max) / 2) / orig_height
+                        w = (x_max - x_min) / orig_width
+                        h = (y_max - y_min) / orig_height
+
+                        x_center = np.clip(x_center, 0.0, 1.0)
+                        y_center = np.clip(y_center, 0.0, 1.0)
+                        w = np.clip(w, 0.0, 1.0)
+                        h = np.clip(h, 0.0, 1.0)
+
+                        bboxes.append(f"{label} {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f}")
+
+            bbox_str = " ".join(bboxes) if bboxes else "-1"
+            predictions.append({'index': idx, 'filename': img_name, 'bbox': bbox_str})
+
+        except Exception as e:
+            print(f"\nОшибка обработки {img_name}: {str(e)}")
+            predictions.append({'index': idx, 'filename': img_name, 'bbox': '-1'})
+
+    submission_df = pd.DataFrame(predictions, columns=['index', 'filename', 'bbox'])
+    submission_df.to_csv(output_file, index=False)
+    print(f"\nSubmission файл создан: {output_file}")
+
+
+def main():
+    try:
+        print("Запуск обработки данных...")
+        train_df, val_df, test_images, train_image_dir, test_image_dir = initialize()
+        train_loader, val_loader, test_loader = create_datasets(
+            train_df, val_df, test_images, train_image_dir, test_image_dir)
+
+        model = train_model(train_loader, val_loader)
+
+        # Визуализация примеров
+        val_dataset = SeagullDataset(val_df, train_image_dir, transform=get_transform(train=False))
+        visualize_predictions(model, val_dataset)
+
+        create_submission(model, test_image_dir)
+
+        print("\nОбработка завершена успешно!")
+    except Exception as e:
+        print(f"\nКритическая ошибка: {str(e)}")
+
+
+if __name__ == "__main__":
+    torch.multiprocessing.freeze_support()
+    main()
